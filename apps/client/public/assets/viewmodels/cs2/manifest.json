@@ -1,0 +1,27 @@
+{
+  "version": 1,
+  "sources": [
+    {
+      "name": "cs2-weapon-animgraphs-rel",
+      "url": "https://github.com/dirtkiller23/cs2-weapon-animgraphs-rel",
+      "commit": "8f09d6f33375a73e3fa2626dc31fec35bb257505",
+      "content": "22 FBX knife models"
+    },
+    {
+      "name": "CS2-MultiRig",
+      "url": "https://github.com/goribby/CS2-MultiRig",
+      "commit": "026058b2a70a55257d6b85563f27b3c31e558f26",
+      "content": "6 complete glTF arms and glove sets with referenced buffers and textures"
+    }
+  ],
+  "catalog": {
+    "knifeModels": 22,
+    "armsAndGloveSets": 6
+  },
+  "runtime": {
+    "lazySelection": true,
+    "sharedSkeleton": false,
+    "proceduralFallback": true,
+    "knifeMaterials": "project runtime finishes"
+  }
+}
