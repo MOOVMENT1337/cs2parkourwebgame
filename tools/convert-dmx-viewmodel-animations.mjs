@@ -78,12 +78,57 @@ const knifeDirectories = (await readdir(sourceRoot, { withFileTypes: true }))
 await mkdir(outputRoot, { recursive: true });
 
 for (const knifeDirectory of knifeDirectories) {
-  const animationsRoot = path.join(sourceRoot, knifeDirectory.name, "anims");
+  const knifeRoot = path.join(sourceRoot, knifeDirectory.name);
+  const animationsRoot = path.join(knifeRoot, "anims");
+  const knifeFiles = await readdir(knifeRoot);
+  const animationFiles = await readdir(animationsRoot);
+  const graphFilename = knifeFiles.find((filename) => filename.endsWith(".vanmgrph"));
+  if (!graphFilename) {
+    throw new Error(`AnimGraph not found for ${knifeDirectory.name}`);
+  }
+  const graphSource = await readFile(path.join(knifeRoot, graphFilename), "utf8");
+  const graphSequences = new Set(
+    Array.from(
+      graphSource.matchAll(/m_sequenceName\s*=\s*"([^"]+)"/g),
+      (match) => match[1],
+    ),
+  );
   const clipFiles = {
     idle: "firstperson_idle.dmx",
     draw: "firstperson_draw.dmx",
-    inspect: "firstperson_lookat01.dmx",
   };
+  const inspectFiles = animationFiles
+    .filter((filename) => /^firstperson_lookat\d+_(?:start|loop|end)\.dmx$/.test(filename))
+    .filter((filename) => graphSequences.has(filename.replace(/\.dmx$/, "")))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+  const attackFiles = animationFiles
+    .filter((filename) => /^firstperson_(?:light|heavy)_miss\d+(?:_noflip)?\.dmx$/.test(filename))
+    // Some source folders contain unused alternates. CS2 only exposes the
+    // sequences wired into the selected knife's AnimGraph.
+    .filter((filename) => graphSequences.has(filename.replace(/\.dmx$/, "")))
+    .sort((left, right) => left.localeCompare(right, undefined, { numeric: true }));
+
+  for (const filename of inspectFiles) {
+    const match = filename.match(
+      /^firstperson_lookat(\d+)_(start|loop|end)\.dmx$/,
+    );
+    if (!match) continue;
+    const [, rawIndex, rawPhase] = match;
+    const phase = `${rawPhase[0].toUpperCase()}${rawPhase.slice(1)}`;
+    clipFiles[`inspect${Number(rawIndex)}${phase}`] = filename;
+  }
+
+  for (const filename of attackFiles) {
+    const match = filename.match(
+      /^firstperson_(light|heavy)_miss(\d+)(_noflip)?\.dmx$/,
+    );
+    if (!match) continue;
+    const [, attackType, index, noFlip] = match;
+    const clipName = noFlip
+      ? `${attackType}NoFlip`
+      : `${attackType}${index}`;
+    clipFiles[clipName] = filename;
+  }
   const clips = {};
 
   for (const [name, filename] of Object.entries(clipFiles)) {

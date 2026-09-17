@@ -1,5 +1,9 @@
 import RAPIER from "@dimforge/rapier3d-compat";
 import * as THREE from "three";
+import type {
+  CheckpointDefinition,
+  TriggerZone,
+} from "./CheckpointSystem";
 
 interface BoxOptions {
   position: THREE.Vector3;
@@ -113,15 +117,10 @@ const addGate = (
   );
 };
 
-export interface LabCheckpoint {
-  z: number;
-  spawn: THREE.Vector3;
-}
-
 export interface LabDefinition {
   spawn: THREE.Vector3;
-  finishZ: number;
-  checkpoints: readonly LabCheckpoint[];
+  finish: TriggerZone;
+  checkpoints: readonly CheckpointDefinition[];
 }
 
 export const buildLab = (
@@ -247,11 +246,39 @@ export const buildLab = (
 
   return {
     spawn: new THREE.Vector3(0, 1.05, 8),
-    finishZ: -170.5,
+    finish: {
+      center: { x: 0, y: 2.5, z: -170.5 },
+      size: { x: 11.6, y: 6.5, z: 0.5 },
+      direction: { x: 0, y: 0, z: -1 },
+    },
     checkpoints: [
-      { z: -10.5, spawn: new THREE.Vector3(0, 1.05, -8.5) },
-      { z: -82.5, spawn: new THREE.Vector3(0, 1.05, -79) },
-      { z: -151, spawn: new THREE.Vector3(0, 1.05, -153.5) },
+      {
+        id: "start-gate",
+        trigger: {
+          center: { x: 0, y: 2.5, z: -10.5 },
+          size: { x: 11.6, y: 6.5, z: 0.5 },
+          direction: { x: 0, y: 0, z: -1 },
+        },
+        spawn: { x: 0, y: 1.05, z: -12 },
+      },
+      {
+        id: "surf-entry",
+        trigger: {
+          center: { x: 0, y: 1.5, z: -82.5 },
+          size: { x: 14.5, y: 8, z: 0.5 },
+          direction: { x: 0, y: 0, z: -1 },
+        },
+        spawn: { x: 0, y: 1.05, z: -84 },
+      },
+      {
+        id: "surf-exit",
+        trigger: {
+          center: { x: 0, y: -2.5, z: -151 },
+          size: { x: 15, y: 12, z: 0.5 },
+          direction: { x: 0, y: 0, z: -1 },
+        },
+        spawn: { x: 0, y: 1.05, z: -153.5 },
+      },
     ],
   };
 };

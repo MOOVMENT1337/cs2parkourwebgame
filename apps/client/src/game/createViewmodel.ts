@@ -1,6 +1,4 @@
 import * as THREE from "three";
-import { FBXLoader } from "three/examples/jsm/loaders/FBXLoader.js";
-import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
   DEFAULT_GLOVE_ID,
   DEFAULT_KNIFE_ID,
@@ -10,10 +8,23 @@ import {
   type GloveId,
   type KnifeId,
 } from "./viewmodelCatalog";
+import {
+  chooseCs2InspectIndex,
+  chooseCs2LightMissIndex,
+  chooseHeldKnifeAttack,
+} from "./viewmodelAnimationRules";
+import {
+  loadCachedJson,
+  loadFbxModel,
+  loadGltfModel,
+} from "./viewmodelLoader";
 
-export type KnifeFinish = "emerald" | "amber" | "violet";
+export type KnifeFinish = "default" | "emerald" | "amber" | "violet";
 
-const FINISH_COLORS: Record<KnifeFinish, { blade: number; accent: number }> = {
+const FINISH_COLORS: Record<
+  Exclude<KnifeFinish, "default">,
+  { blade: number; accent: number }
+> = {
   emerald: { blade: 0x76e6c2, accent: 0x10b981 },
   amber: { blade: 0xffcb70, accent: 0xf59e0b },
   violet: { blade: 0xc4a8ff, accent: 0x8b5cf6 },
@@ -62,6 +73,7 @@ const disposeObjectResources = (root: THREE.Object3D): void => {
 
 const frameImportedArms = (arms: THREE.Group): void => {
   arms.position.set(0, 0, 0);
+  arms.rotation.set(0, Math.PI, 0);
   arms.scale.setScalar(1);
   arms.updateMatrixWorld(true);
 
@@ -79,7 +91,7 @@ const frameImportedArms = (arms: THREE.Group): void => {
     .setFromObject(arms, true)
     .getCenter(new THREE.Vector3());
   arms.position.add(
-    new THREE.Vector3(0.12, -0.26, -0.94).sub(fittedCenter),
+    new THREE.Vector3(0.12, -0.4, -0.94).sub(fittedCenter),
   );
 };
 
@@ -110,11 +122,47 @@ const retargetSleeveToArms = (
     prepareViewmodelMesh(object);
   });
 
+  // The sleeve scene still contains its original helper skeleton after the
+  // mesh is rebound. Rename those bones so animation binding and hand lookup
+  // cannot confuse them with the active arms rig.
+  sleeve.traverse((object) => {
+    if (object instanceof THREE.Bone) object.name = `ct_sleeve_source_${object.name}`;
+  });
+
   sleeve.name = "ct-sleeve";
   arms.add(sleeve);
 };
 
-type ViewmodelAnimationKind = "idle" | "draw" | "inspect";
+type ViewmodelAnimationKind =
+  | "idle"
+  | "draw"
+  | `inspect${number}Start`
+  | `inspect${number}Loop`
+  | `inspect${number}End`
+  | `light${number}`
+  | `heavy${number}`;
+type KnifeAttackType = "primary" | "secondary";
+
+const isAttackAnimation = (
+  kind: ViewmodelAnimationKind | null,
+): boolean =>
+  kind?.startsWith("light") === true || kind?.startsWith("heavy") === true;
+
+const isInspectAnimation = (
+  kind: ViewmodelAnimationKind | null,
+): boolean => kind?.startsWith("inspect") === true;
+
+const isInspectStartAnimation = (
+  kind: ViewmodelAnimationKind | null,
+): boolean => /^inspect\d+Start$/.test(kind ?? "");
+
+const isInspectLoopAnimation = (
+  kind: ViewmodelAnimationKind | null,
+): boolean => /^inspect\d+Loop$/.test(kind ?? "");
+
+const isInspectEndAnimation = (
+  kind: ViewmodelAnimationKind | null,
+): boolean => /^inspect\d+End$/.test(kind ?? "");
 
 interface SerializedAnimationTrack {
   node: string;
@@ -132,7 +180,7 @@ interface SerializedAnimationClip {
 interface SerializedViewmodelAnimations {
   version: 1;
   source: string;
-  clips: Record<ViewmodelAnimationKind, SerializedAnimationClip>;
+  clips: Record<string, SerializedAnimationClip>;
 }
 
 interface TargetAnimationClips {
@@ -140,18 +188,74 @@ interface TargetAnimationClips {
   knife: THREE.AnimationClip;
 }
 
+interface TargetAnimationActions {
+  arms: THREE.AnimationAction;
+  knife: THREE.AnimationAction;
+}
+
+interface InspectAnimationSet {
+  start: ViewmodelAnimationKind;
+  loop: ViewmodelAnimationKind;
+  end: ViewmodelAnimationKind;
+}
+
 const loadViewmodelAnimations = async (
   id: KnifeId,
 ): Promise<SerializedViewmodelAnimations> => {
-  const response = await fetch(`/assets/viewmodels/cs2/animations/${id}.json`);
-  if (!response.ok) {
-    throw new Error(`Could not load animations for ${id}: ${response.status}`);
-  }
-  const document = await response.json() as SerializedViewmodelAnimations;
-  if (document.version !== 1 || document.source !== id) {
-    throw new Error(`Invalid animation document for ${id}`);
-  }
-  return document;
+  const requiredClips: ViewmodelAnimationKind[] = [
+    "idle",
+    "draw",
+    "inspect1Start",
+    "inspect1Loop",
+    "inspect1End",
+    "light1",
+    "heavy1",
+  ];
+  const isAnimationDocument = (
+    value: unknown,
+  ): value is SerializedViewmodelAnimations => {
+    if (!value || typeof value !== "object") return false;
+    const document = value as Partial<SerializedViewmodelAnimations>;
+    if (
+      document.version !== 1
+      || document.source !== id
+      || !document.clips
+      || requiredClips.some((kind) => !document.clips?.[kind])
+    ) return false;
+
+    let keyframeCount = 0;
+    return Object.values(document.clips).every((clip) => {
+      if (
+        !clip
+        || typeof clip.name !== "string"
+        || !Number.isFinite(clip.duration)
+        || clip.duration <= 0
+        || !Array.isArray(clip.tracks)
+        || clip.tracks.length > 512
+      ) return false;
+      return clip.tracks.every((track) => {
+        if (
+          !track
+          || typeof track.node !== "string"
+          || (track.property !== "position" && track.property !== "quaternion")
+          || !Array.isArray(track.times)
+          || !Array.isArray(track.values)
+          || !track.times.every(Number.isFinite)
+          || !track.values.every(Number.isFinite)
+        ) return false;
+        const valuesPerKey = track.property === "quaternion" ? 4 : 3;
+        keyframeCount += track.times.length;
+        return keyframeCount <= 250_000
+          && track.values.length === track.times.length * valuesPerKey;
+      });
+    });
+  };
+
+  return loadCachedJson(
+    `/assets/viewmodels/cs2/animations/${id}.json`,
+    24 * 1024 * 1024,
+    isAnimationDocument,
+  );
 };
 
 const createAnimationClip = (
@@ -174,35 +278,70 @@ const createAnimationClip = (
   return new THREE.AnimationClip(`${source.name}-${suffix}`, source.duration, tracks);
 };
 
-const createImportedKnifeMaterial = (
-  finish: KnifeFinish,
-): THREE.MeshPhysicalMaterial => {
-  const colors = FINISH_COLORS[finish];
-  const material = new THREE.MeshPhysicalMaterial({
-    color: colors.blade,
-    emissive: colors.accent,
-    emissiveIntensity: 0.08,
-    metalness: 0.88,
-    roughness: 0.24,
-    clearcoat: 0.7,
-    clearcoatRoughness: 0.2,
-  });
-  material.userData.knifeFinishMaterial = true;
-  return material;
+interface FactoryKnifeMaterialState {
+  color?: number;
+  emissive?: number;
+  emissiveIntensity?: number;
+}
+
+const rememberFactoryKnifeMaterial = (material: THREE.Material): void => {
+  if (material.userData.factoryKnifeMaterial) return;
+
+  const state: FactoryKnifeMaterialState = {};
+  if ("color" in material && material.color instanceof THREE.Color) {
+    state.color = material.color.getHex();
+  }
+  if ("emissive" in material && material.emissive instanceof THREE.Color) {
+    state.emissive = material.emissive.getHex();
+  }
+  if (
+    "emissiveIntensity" in material
+    && typeof material.emissiveIntensity === "number"
+  ) {
+    state.emissiveIntensity = material.emissiveIntensity;
+  }
+  material.userData.factoryKnifeMaterial = state;
 };
 
 const applyImportedKnifeFinish = (
   root: THREE.Object3D,
   finish: KnifeFinish,
 ): void => {
-  const colors = FINISH_COLORS[finish];
   root.traverse((object) => {
     if (!(object instanceof THREE.Mesh)) return;
     const materials = Array.isArray(object.material)
       ? object.material
       : [object.material];
     for (const material of materials) {
-      if (!material.userData.knifeFinishMaterial) continue;
+      rememberFactoryKnifeMaterial(material);
+      const factory = material.userData
+        .factoryKnifeMaterial as FactoryKnifeMaterialState;
+
+      if (finish === "default") {
+        if (
+          factory.color !== undefined
+          && "color" in material
+          && material.color instanceof THREE.Color
+        ) {
+          material.color.setHex(factory.color);
+        }
+        if (
+          factory.emissive !== undefined
+          && "emissive" in material
+          && material.emissive instanceof THREE.Color
+        ) {
+          material.emissive.setHex(factory.emissive);
+        }
+        if (
+          factory.emissiveIntensity !== undefined
+          && "emissiveIntensity" in material
+        ) {
+          material.emissiveIntensity = factory.emissiveIntensity;
+        }
+        continue;
+      }
+
+      const colors = FINISH_COLORS[finish];
       if ("color" in material && material.color instanceof THREE.Color) {
         material.color.setHex(colors.blade);
       }
@@ -307,7 +446,11 @@ export interface FirstPersonViewmodel {
   setKnife: (id: KnifeId) => Promise<void>;
   setGloves: (id: GloveId) => Promise<void>;
   setFinish: (finish: KnifeFinish) => void;
-  inspect: () => void;
+  setOffset: (x: number, y: number, z: number) => void;
+  setInspectHeld: (held: boolean) => void;
+  attackPrimary: () => void;
+  attackSecondary: () => void;
+  setAttackHeld: (primary: boolean, secondary: boolean) => void;
   update: (
     elapsedSeconds: number,
     horizontalSpeedUps: number,
@@ -372,16 +515,19 @@ export const createFirstPersonViewmodel = (
     roughness: 0.56,
     metalness: 0.38,
   });
+  const initialColors = initialFinish === "default"
+    ? { blade: 0xb9c0c5, accent: 0x38434b }
+    : FINISH_COLORS[initialFinish];
   const accentMaterial = new THREE.MeshStandardMaterial({
-    color: FINISH_COLORS[initialFinish].accent,
-    emissive: FINISH_COLORS[initialFinish].accent,
+    color: initialColors.accent,
+    emissive: initialColors.accent,
     emissiveIntensity: 0.48,
     roughness: 0.36,
     metalness: 0.5,
   });
   const bladeMaterial = new THREE.MeshStandardMaterial({
-    color: FINISH_COLORS[initialFinish].blade,
-    emissive: FINISH_COLORS[initialFinish].accent,
+    color: initialColors.blade,
+    emissive: initialColors.accent,
     emissiveIntensity: 0.1,
     roughness: 0.22,
     metalness: 0.86,
@@ -450,6 +596,7 @@ export const createFirstPersonViewmodel = (
   group.add(keyLight);
 
   let importedArms: THREE.Group | null = null;
+  let framedArms: THREE.Group | null = null;
   let importedArmsMixer: THREE.AnimationMixer | null = null;
   let importedKnife: THREE.Group | null = null;
   let importedKnifeMixer: THREE.AnimationMixer | null = null;
@@ -457,42 +604,128 @@ export const createFirstPersonViewmodel = (
   let targetAnimationClips: Partial<
     Record<ViewmodelAnimationKind, TargetAnimationClips>
   > = {};
+  let activeAnimationActions: TargetAnimationActions | null = null;
   let activeAnimationKind: ViewmodelAnimationKind | null = null;
   let activeAnimationElapsedSeconds = 0;
   let activeAnimationDurationSeconds = 0;
+  let primaryAttackKinds: ViewmodelAnimationKind[] = [];
+  let secondaryAttackKinds: ViewmodelAnimationKind[] = [];
+  let inspectAnimationSets: InspectAnimationSet[] = [];
+  let activeInspectAnimationSet: InspectAnimationSet | null = null;
+  let primaryAttackHeld = false;
+  let secondaryAttackHeld = false;
+  let inspectHeld = false;
   let lastAnimationElapsedSeconds: number | null = null;
   let activeFinish = initialFinish;
   let armsRequestRevision = 0;
   let knifeRequestRevision = 0;
   let disposed = false;
+  const viewmodelOffset = new THREE.Vector3();
 
-  const playAnimation = (kind: ViewmodelAnimationKind): void => {
+  const alignKnifeToRightHand = (): void => {
+    if (!importedArms || !importedKnife) return;
+    const armsHand = importedArms.getObjectByName("hand_r");
+    const knifeHand = importedKnife.getObjectByName("hand_r");
+    if (!armsHand || !knifeHand || importedKnife.parent !== importedArms) return;
+
+    importedArms.updateMatrixWorld(true);
+    const knifeHandInRoot = importedKnife.matrixWorld
+      .clone()
+      .invert()
+      .multiply(knifeHand.matrixWorld);
+    const targetHandInArms = importedArms.matrixWorld
+      .clone()
+      .invert()
+      .multiply(armsHand.matrixWorld);
+    const alignedRoot = targetHandInArms.multiply(knifeHandInRoot.invert());
+
+    importedKnife.matrixAutoUpdate = false;
+    importedKnife.matrix.copy(alignedRoot);
+    importedKnife.matrixWorldNeedsUpdate = true;
+    importedKnife.updateMatrixWorld(true);
+  };
+
+  const playAnimation = (
+    kind: ViewmodelAnimationKind,
+    fadeSeconds = 0,
+  ): void => {
     const clips = targetAnimationClips[kind];
     if (!clips || !importedArmsMixer || !importedKnifeMixer) return;
 
-    importedArmsMixer.stopAllAction();
-    importedKnifeMixer.stopAllAction();
-    const loop = kind === "idle" ? THREE.LoopRepeat : THREE.LoopOnce;
-    const repetitions = kind === "idle" ? Infinity : 1;
-    for (const [mixer, clip] of [
-      [importedArmsMixer, clips.arms],
-      [importedKnifeMixer, clips.knife],
+    const shouldLoop = kind === "idle" || isInspectLoopAnimation(kind);
+    const loop = shouldLoop ? THREE.LoopRepeat : THREE.LoopOnce;
+    const repetitions = shouldLoop ? Infinity : 1;
+    const nextActions = {} as TargetAnimationActions;
+    for (const [target, mixer, clip] of [
+      ["arms", importedArmsMixer, clips.arms],
+      ["knife", importedKnifeMixer, clips.knife],
     ] as const) {
       const action = mixer.clipAction(clip);
       action.reset();
       action.enabled = true;
       action.paused = false;
-      action.clampWhenFinished = kind !== "idle";
+      action.clampWhenFinished = !shouldLoop;
       action.setLoop(loop, repetitions);
       action.play();
+      const previousAction = activeAnimationActions?.[target];
+      if (previousAction && previousAction !== action && fadeSeconds > 0) {
+        previousAction.crossFadeTo(action, fadeSeconds, false);
+      } else if (previousAction && previousAction !== action) {
+        previousAction.stop();
+      }
+      nextActions[target] = action;
     }
 
+    activeAnimationActions = nextActions;
     activeAnimationKind = kind;
     activeAnimationElapsedSeconds = 0;
     activeAnimationDurationSeconds = Math.max(
       clips.arms.duration,
       clips.knife.duration,
     );
+  };
+
+  const startAttack = (attackType: KnifeAttackType): void => {
+    const isPrimary = attackType === "primary";
+    const attackKinds = isPrimary ? primaryAttackKinds : secondaryAttackKinds;
+    if (attackKinds.length === 0) return;
+
+    // Source 2's miss-center node is WeightedRandom (50/50 for
+    // light1/light2), resets on every attack, and may repeat a variant.
+    const kind = attackKinds[
+      chooseCs2LightMissIndex(attackKinds.length, Math.random())
+    ];
+    if (!kind) return;
+    activeInspectAnimationSet = null;
+    playAnimation(kind, 0.035);
+  };
+
+  const requestAttack = (attackType: KnifeAttackType): void => {
+    // A released click during the current swing is not buffered. Holding the
+    // button is sampled again when the authored attack clip finishes.
+    if (isAttackAnimation(activeAnimationKind)) return;
+    startAttack(attackType);
+  };
+
+  const chooseInspectAnimationSet = (): InspectAnimationSet | null => {
+    if (inspectAnimationSets.length === 0) return null;
+    if (inspectAnimationSets.length === 1) return inspectAnimationSets[0] ?? null;
+
+    // Source 2 uses 2/3 + 1/3 for two variants and
+    // 1/2 + 1/4 + 1/4 for three variants.
+    const index = chooseCs2InspectIndex(
+      inspectAnimationSets.length,
+      Math.random(),
+    );
+    return inspectAnimationSets[index] ?? inspectAnimationSets[0] ?? null;
+  };
+
+  const startInspect = (): void => {
+    if (isAttackAnimation(activeAnimationKind)) return;
+    const animationSet = chooseInspectAnimationSet();
+    if (!animationSet) return;
+    activeInspectAnimationSet = animationSet;
+    playAnimation(animationSet.start, 0.08);
   };
 
   const configureAnimations = (playDraw = true): void => {
@@ -502,47 +735,85 @@ export const createFirstPersonViewmodel = (
     importedKnifeMixer?.stopAllAction();
     importedArmsMixer = new THREE.AnimationMixer(importedArms);
     importedKnifeMixer = new THREE.AnimationMixer(importedKnife);
+    activeAnimationActions = null;
 
     const armsBones = new Set<string>();
     importedArms.traverse((object) => {
       if (object instanceof THREE.Bone) armsBones.add(object.name);
     });
-    const acceptsKnifeNode = (node: string): boolean =>
-      node === "weapon_hand_r" || node.startsWith("v_weapon_");
+    const knifeBones = new Set<string>();
+    importedKnife.traverse((object) => {
+      if (object instanceof THREE.Bone) knifeBones.add(object.name);
+    });
 
     targetAnimationClips = {};
-    for (const kind of ["idle", "draw", "inspect"] as const) {
-      const source = importedAnimations.clips[kind];
-      targetAnimationClips[kind] = {
+    for (const [kind, source] of Object.entries(importedAnimations.clips)) {
+      const animationKind = kind as ViewmodelAnimationKind;
+      targetAnimationClips[animationKind] = {
         arms: createAnimationClip(
           source,
-          (node) => armsBones.has(node) && !acceptsKnifeNode(node),
+          (node) => armsBones.has(node),
           "arms",
         ),
-        knife: createAnimationClip(source, acceptsKnifeNode, "knife"),
+        knife: createAnimationClip(
+          source,
+          (node) => knifeBones.has(node),
+          "knife",
+        ),
       };
     }
+    const animationKinds = Object.keys(
+      targetAnimationClips,
+    ) as ViewmodelAnimationKind[];
+    const sortByAttackIndex = (
+      left: ViewmodelAnimationKind,
+      right: ViewmodelAnimationKind,
+    ): number => Number(left.match(/\d+$/)?.[0] ?? 0)
+      - Number(right.match(/\d+$/)?.[0] ?? 0);
+    primaryAttackKinds = animationKinds
+      .filter((kind) => /^light[12]$/.test(kind))
+      .sort(sortByAttackIndex);
+    secondaryAttackKinds = animationKinds
+      .filter((kind) => kind === "heavy1")
+      .sort(sortByAttackIndex);
+    const inspectIndexes = Array.from(new Set(
+      animationKinds.flatMap((kind) => {
+        const match = kind.match(/^inspect(\d+)Start$/);
+        return match ? [Number(match[1])] : [];
+      }),
+    )).sort((left, right) => left - right);
+    inspectAnimationSets = inspectIndexes.flatMap((index) => {
+      const animationSet: InspectAnimationSet = {
+        start: `inspect${index}Start`,
+        loop: `inspect${index}Loop`,
+        end: `inspect${index}End`,
+      };
+      return targetAnimationClips[animationSet.start]
+        && targetAnimationClips[animationSet.loop]
+        && targetAnimationClips[animationSet.end]
+        ? [animationSet]
+        : [];
+    });
+    activeInspectAnimationSet = null;
+    inspectHeld = false;
 
     importedKnife.parent?.remove(importedKnife);
     group.add(importedKnife);
+    importedKnife.matrixAutoUpdate = true;
+    importedKnife.position.set(0, 0, 0);
+    importedKnife.quaternion.identity();
+    importedKnife.scale.setScalar(0.0254);
     playAnimation("idle");
     importedArmsMixer.update(0);
     importedKnifeMixer.update(0);
-    frameImportedArms(importedArms);
+    if (framedArms !== importedArms) {
+      frameImportedArms(importedArms);
+      framedArms = importedArms;
+    }
 
-    importedKnife.position.set(0, 0, 0);
-    importedKnife.rotation.set(0, 0, 0);
-    importedKnife.scale.setScalar(1);
     importedArms.add(importedKnife);
     importedKnife.visible = true;
-    importedArms.updateMatrixWorld(true);
-    const knifeBounds = new THREE.Box3().setFromObject(importedKnife, true);
-    const knifeCenter = knifeBounds.getCenter(new THREE.Vector3());
-    const knifeSize = knifeBounds.getSize(new THREE.Vector3());
-    console.info("viewmodel knife bounds", {
-      center: knifeCenter.toArray(),
-      size: knifeSize.toArray(),
-    });
+    alignKnifeToRightHand();
     proceduralKnife.visible = false;
     proceduralArms.visible = false;
     lastAnimationElapsedSeconds = null;
@@ -554,9 +825,9 @@ export const createFirstPersonViewmodel = (
     try {
       const sleeveUrl = getGloveSleeveUrl(id);
       const [gltf, sleeveGltf] = await Promise.all([
-        new GLTFLoader().loadAsync(getGloveModelUrl(id)),
+        loadGltfModel(getGloveModelUrl(id)).then((scene) => ({ scene })),
         sleeveUrl
-          ? new GLTFLoader().loadAsync(sleeveUrl)
+          ? loadGltfModel(sleeveUrl).then((scene) => ({ scene }))
           : Promise.resolve(null),
       ]);
       const arms = gltf.scene;
@@ -581,6 +852,7 @@ export const createFirstPersonViewmodel = (
         importedArmsMixer?.stopAllAction();
         importedArmsMixer?.uncacheRoot(importedArms);
         group.remove(importedArms);
+        if (framedArms === importedArms) framedArms = null;
         disposeObjectResources(importedArms);
       }
       importedArms = arms;
@@ -591,6 +863,9 @@ export const createFirstPersonViewmodel = (
     } catch (error) {
       if (!importedArms) proceduralArms.visible = true;
       console.warn(`Could not load first-person arms: ${id}`, error);
+      throw new Error(`Не удалось загрузить модель перчаток «${id}»`, {
+        cause: error,
+      });
     }
   };
 
@@ -598,23 +873,19 @@ export const createFirstPersonViewmodel = (
     const revision = ++knifeRequestRevision;
     try {
       const [knifeModel, animationSet] = await Promise.all([
-        new FBXLoader().loadAsync(getKnifeModelUrl(id)),
+        loadFbxModel(getKnifeModelUrl(id)),
         loadViewmodelAnimations(id),
       ]);
       knifeModel.name = `cs2-${id}`;
       knifeModel.traverse((object) => {
         if (!(object instanceof THREE.Mesh)) return;
-        const oldMaterials = Array.isArray(object.material)
+        const materials = Array.isArray(object.material)
           ? object.material
           : [object.material];
-        for (const material of oldMaterials) material.dispose();
-        const nextMaterials = oldMaterials.map(() =>
-          createImportedKnifeMaterial(activeFinish),
-        );
-        object.material =
-          nextMaterials.length === 1 ? nextMaterials[0] : nextMaterials;
+        for (const material of materials) rememberFactoryKnifeMaterial(material);
         prepareViewmodelMesh(object);
       });
+      applyImportedKnifeFinish(knifeModel, activeFinish);
       if (disposed || revision !== knifeRequestRevision) {
         disposeObjectResources(knifeModel);
         return;
@@ -635,6 +906,9 @@ export const createFirstPersonViewmodel = (
     } catch (error) {
       if (!importedKnife) proceduralKnife.visible = true;
       console.warn(`Could not load first-person knife: ${id}`, error);
+      throw new Error(`Не удалось загрузить модель ножа «${id}»`, {
+        cause: error,
+      });
     }
   };
 
@@ -647,15 +921,37 @@ export const createFirstPersonViewmodel = (
     setGloves: loadGloves,
     setFinish: (finish) => {
       activeFinish = finish;
-      const colors = FINISH_COLORS[finish];
+      const colors = finish === "default"
+        ? { blade: 0xb9c0c5, accent: 0x38434b }
+        : FINISH_COLORS[finish];
       bladeMaterial.color.setHex(colors.blade);
       bladeMaterial.emissive.setHex(colors.accent);
       accentMaterial.color.setHex(colors.accent);
       accentMaterial.emissive.setHex(colors.accent);
       if (importedKnife) applyImportedKnifeFinish(importedKnife, finish);
     },
-    inspect: () => {
-      playAnimation("inspect");
+    setOffset: (x, y, z) => {
+      viewmodelOffset.set(x, y, z);
+      group.position.set(x, -0.045 + y, z);
+    },
+    setInspectHeld: (held) => {
+      const wasHeld = inspectHeld;
+      inspectHeld = held;
+      if (held && !wasHeld && !isAttackAnimation(activeAnimationKind)) {
+        if (!isInspectAnimation(activeAnimationKind)) startInspect();
+      } else if (
+        !held
+        && isInspectLoopAnimation(activeAnimationKind)
+        && activeInspectAnimationSet
+      ) {
+        playAnimation(activeInspectAnimationSet.end, 0.08);
+      }
+    },
+    attackPrimary: () => requestAttack("primary"),
+    attackSecondary: () => requestAttack("secondary"),
+    setAttackHeld: (primary, secondary) => {
+      primaryAttackHeld = primary;
+      secondaryAttackHeld = secondary;
     },
     update: (elapsedSeconds, horizontalSpeedUps, grounded, running) => {
       if (importedArmsMixer && importedKnifeMixer) {
@@ -669,13 +965,32 @@ export const createFirstPersonViewmodel = (
         lastAnimationElapsedSeconds = elapsedSeconds;
         importedArmsMixer.update(deltaSeconds);
         importedKnifeMixer.update(deltaSeconds);
+        alignKnifeToRightHand();
         activeAnimationElapsedSeconds += deltaSeconds;
         if (
           activeAnimationKind !== "idle"
+          && !isInspectLoopAnimation(activeAnimationKind)
           && activeAnimationKind !== null
           && activeAnimationElapsedSeconds >= activeAnimationDurationSeconds
         ) {
-          playAnimation("idle");
+          if (isInspectStartAnimation(activeAnimationKind)) {
+            if (!activeInspectAnimationSet) playAnimation("idle", 0.08);
+            else if (inspectHeld) {
+              playAnimation(activeInspectAnimationSet.loop, 0);
+            } else {
+              playAnimation(activeInspectAnimationSet.end, 0);
+            }
+          } else if (isInspectEndAnimation(activeAnimationKind)) {
+            activeInspectAnimationSet = null;
+            playAnimation("idle", 0.08);
+          } else {
+            const nextAttack = isAttackAnimation(activeAnimationKind)
+              ? chooseHeldKnifeAttack(primaryAttackHeld, secondaryAttackHeld)
+              : null;
+            if (nextAttack) startAttack(nextAttack);
+            else if (inspectHeld) startInspect();
+            else playAnimation("idle", 0.08);
+          }
         }
       }
 
@@ -686,8 +1001,13 @@ export const createFirstPersonViewmodel = (
         Math.abs(Math.cos(elapsedSeconds * cadence)) * 0.011 * speedFactor;
       const airOffset = grounded ? 0 : -0.012;
 
-      group.position.x += (bobX - group.position.x) * 0.14;
-      group.position.y += (-0.045 - bobY + airOffset - group.position.y) * 0.14;
+      group.position.x +=
+        (viewmodelOffset.x + bobX - group.position.x) * 0.14;
+      group.position.y +=
+        (-0.045 + viewmodelOffset.y - bobY + airOffset - group.position.y)
+        * 0.14;
+      group.position.z +=
+        (viewmodelOffset.z - group.position.z) * 0.14;
       group.rotation.z +=
         (Math.sin(elapsedSeconds * cadence * 0.5) * 0.009 * speedFactor -
           group.rotation.z) *
@@ -704,6 +1024,7 @@ export const createFirstPersonViewmodel = (
       if (importedKnife) importedKnifeMixer?.uncacheRoot(importedKnife);
       importedArmsMixer = null;
       importedKnifeMixer = null;
+      activeAnimationActions = null;
       importedAnimations = null;
       targetAnimationClips = {};
       disposeObjectResources(group);

@@ -2,11 +2,15 @@ import RAPIER from "@dimforge/rapier3d-compat";
 import {
   COMMUNITY_AUTOBHOP_SURF_V0,
   PLAYER_DIMENSIONS,
-  clipVelocityToPlane,
+  RunButton,
+  createRunReplay,
+  isRunReplay,
   length2d,
-  simulateMovement,
-  type MovementInput,
   type MovementState,
+  type RunInputFrame,
+  type RunReplay,
+  simulateRunTick,
+  type Vec3,
 } from "@parkour/movement";
 import * as THREE from "three";
 import { buildLab, type LabDefinition } from "./buildLab";
@@ -21,6 +25,12 @@ import {
   type GloveId,
   type KnifeId,
 } from "./viewmodelCatalog";
+import {
+  VIEWMODEL_POSITION_CONFIG,
+  resolveViewmodelPosition,
+  type ViewmodelPosition,
+} from "./viewmodelConfig";
+import { CheckpointSystem } from "./CheckpointSystem";
 
 export type { KnifeFinish } from "./createViewmodel";
 export type { GloveId, KnifeId } from "./viewmodelCatalog";
@@ -52,15 +62,31 @@ interface RuntimeCallbacks {
   onStatus: (status: RuntimeStatus) => void;
 }
 
+export interface RuntimeOptions {
+  fov?: number;
+  mouseSensitivity?: number;
+  autoBhop?: boolean;
+  shadows?: boolean;
+  pixelRatio?: number;
+  antialias?: boolean;
+  fpsLimit?: number;
+  gameVolume?: number;
+  knifeId?: KnifeId;
+  gloveId?: GloveId;
+  knifeFinish?: KnifeFinish;
+  viewmodelOffset?: ViewmodelPosition;
+}
+
 const SOURCE_UNIT_METERS = 0.0254;
 const MAX_FRAME_DELTA_SECONDS = 0.1;
 const TELEMETRY_INTERVAL_SECONDS = 0.08;
 const BEST_TIME_KEY = "parkour-flow:movement-lab:best";
+const LAST_REPLAY_KEY = "parkour-flow:movement-lab:last-replay";
 const MAX_WALKABLE_SLOPE_RADIANS = (44 * Math.PI) / 180;
 const MAX_SURF_NORMAL_Y = Math.cos(MAX_WALKABLE_SLOPE_RADIANS);
 
 const createInitialMovementState = (
-  spawn: THREE.Vector3,
+  spawn: Vec3,
 ): MovementState => ({
   position: { x: spawn.x, y: spawn.y, z: spawn.z },
   velocity: { x: 0, y: 0, z: 0 },
@@ -82,6 +108,7 @@ export class GameRuntime {
   private playerCollider: RAPIER.Collider | null = null;
   private characterController: RAPIER.KinematicCharacterController | null = null;
   private lab: LabDefinition | null = null;
+  private checkpointSystem: CheckpointSystem | null = null;
   private viewmodel: FirstPersonViewmodel | null = null;
   private movementState: MovementState | null = null;
   private status: RuntimeStatus = "loading";
@@ -95,29 +122,70 @@ export class GameRuntime {
   private currentCheckpoint = 0;
   private bestSeconds: number | null = null;
   private surfing = false;
-  private selectedKnifeFinish: KnifeFinish = "emerald";
+  private selectedKnifeFinish: KnifeFinish = "default";
   private selectedKnife: KnifeId = DEFAULT_KNIFE_ID;
   private selectedGloves: GloveId = DEFAULT_GLOVE_ID;
+  private viewmodelOffset: ViewmodelPosition = {
+    ...VIEWMODEL_POSITION_CONFIG.default,
+  };
   private mouseSensitivity = 0.0021;
+  private autoBhop = true;
+  private jumpQueued = false;
+  private fpsLimit = 0;
+  private gameVolume = 0.8;
+  private lastRenderSeconds = 0;
+  private replayFrames: RunInputFrame[] = [];
+  private playbackFrames: readonly RunInputFrame[] | null = null;
+  private lastReplay: RunReplay | null = null;
+  private primaryAttackHeld = false;
+  private secondaryAttackHeld = false;
+  private inspectHeld = false;
   private disposed = false;
 
-  public constructor(canvas: HTMLCanvasElement, callbacks: RuntimeCallbacks) {
+  public constructor(
+    canvas: HTMLCanvasElement,
+    callbacks: RuntimeCallbacks,
+    options: RuntimeOptions = {},
+  ) {
     this.canvas = canvas;
     this.callbacks = callbacks;
+    this.selectedKnife = options.knifeId ?? this.selectedKnife;
+    this.selectedGloves = options.gloveId ?? this.selectedGloves;
+    this.selectedKnifeFinish = options.knifeFinish ?? this.selectedKnifeFinish;
+    this.viewmodelOffset = options.viewmodelOffset
+      ? { ...options.viewmodelOffset }
+      : this.viewmodelOffset;
+    this.mouseSensitivity = THREE.MathUtils.clamp(
+      options.mouseSensitivity ?? this.mouseSensitivity,
+      0.0008,
+      0.0045,
+    );
+    this.autoBhop = options.autoBhop ?? this.autoBhop;
+    this.fpsLimit = options.fpsLimit ?? this.fpsLimit;
+    this.gameVolume = THREE.MathUtils.clamp(
+      options.gameVolume ?? this.gameVolume,
+      0,
+      1,
+    );
+    this.camera.fov = THREE.MathUtils.clamp(options.fov ?? 82, 70, 105);
     this.renderer = new THREE.WebGLRenderer({
       canvas,
-      antialias: true,
+      antialias: options.antialias ?? true,
       powerPreference: "high-performance",
     });
-    this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.75));
+    this.renderer.setPixelRatio(Math.min(
+      window.devicePixelRatio,
+      options.pixelRatio ?? 1.75,
+    ));
     this.renderer.outputColorSpace = THREE.SRGBColorSpace;
     this.renderer.toneMapping = THREE.ACESFilmicToneMapping;
     this.renderer.toneMappingExposure = 1.05;
     this.renderer.autoClear = false;
-    this.renderer.shadowMap.enabled = true;
+    this.renderer.shadowMap.enabled = options.shadows ?? true;
     this.renderer.shadowMap.type = THREE.PCFShadowMap;
 
     this.bestSeconds = this.readBestTime();
+    this.lastReplay = this.readLastReplay();
     this.attachEvents();
   }
 
@@ -164,14 +232,14 @@ export class GameRuntime {
     this.viewmodel?.setFinish(finish);
   };
 
-  public setKnifeModel = (knife: KnifeId): void => {
+  public setKnifeModel = async (knife: KnifeId): Promise<void> => {
     this.selectedKnife = knife;
-    void this.viewmodel?.setKnife(knife);
+    await this.viewmodel?.setKnife(knife);
   };
 
-  public setGloveModel = (gloves: GloveId): void => {
+  public setGloveModel = async (gloves: GloveId): Promise<void> => {
     this.selectedGloves = gloves;
-    void this.viewmodel?.setGloves(gloves);
+    await this.viewmodel?.setGloves(gloves);
   };
 
   public setFov = (fov: number): void => {
@@ -183,6 +251,42 @@ export class GameRuntime {
     this.mouseSensitivity = THREE.MathUtils.clamp(sensitivity, 0.0008, 0.0045);
   };
 
+  public setAutoBhop = (enabled: boolean): void => {
+    this.autoBhop = enabled;
+    this.jumpQueued = false;
+  };
+
+  public setGameVolume = (volume: number): void => {
+    this.gameVolume = THREE.MathUtils.clamp(volume, 0, 1);
+  };
+
+  public setGraphics = (options: {
+    shadows?: boolean;
+    pixelRatio?: number;
+    fpsLimit?: number;
+  }): void => {
+    if (options.shadows !== undefined) {
+      this.renderer.shadowMap.enabled = options.shadows;
+    }
+    if (options.pixelRatio !== undefined) {
+      this.renderer.setPixelRatio(Math.min(
+        window.devicePixelRatio,
+        THREE.MathUtils.clamp(options.pixelRatio, 0.75, 2),
+      ));
+      this.resize();
+    }
+    if (options.fpsLimit !== undefined) {
+      this.fpsLimit = Math.max(0, Math.round(options.fpsLimit));
+      this.lastRenderSeconds = 0;
+    }
+  };
+
+  public setViewmodelOffset = (x: number, y: number, z: number): void => {
+    this.viewmodelOffset = { x, y, z };
+    const position = resolveViewmodelPosition(this.viewmodelOffset);
+    this.viewmodel?.setOffset(position.x, position.y, position.z);
+  };
+
   public reset = (): void => {
     if (!this.lab || !this.playerCollider) {
       return;
@@ -192,12 +296,27 @@ export class GameRuntime {
     this.playerCollider.setTranslation(this.movementState.position);
     this.elapsedTicks = 0;
     this.accumulatorSeconds = 0;
+    this.lastRenderSeconds = 0;
     this.currentCheckpoint = 0;
+    this.checkpointSystem?.reset();
     this.surfing = false;
+    this.jumpQueued = false;
+    this.replayFrames = [];
+    this.playbackFrames = null;
     this.yaw = 0;
     this.pitch = 0;
     this.syncCamera();
     this.emitTelemetry();
+  };
+
+  public playLastReplay = (): boolean => {
+    if (!this.lastReplay || this.lastReplay.profileId !== COMMUNITY_AUTOBHOP_SURF_V0.id) {
+      return false;
+    }
+    this.reset();
+    this.playbackFrames = this.lastReplay.frames;
+    this.setStatus("running");
+    return true;
   };
 
   public dispose(): void {
@@ -252,12 +371,26 @@ export class GameRuntime {
       this.selectedGloves,
     );
     this.viewmodelCamera.add(this.viewmodel.group);
+    this.setViewmodelOffset(
+      this.viewmodelOffset.x,
+      this.viewmodelOffset.y,
+      this.viewmodelOffset.z,
+    );
   }
 
   private createPhysics(): void {
     this.world = new RAPIER.World({ x: 0, y: 0, z: 0 });
     this.world.timestep = 1 / COMMUNITY_AUTOBHOP_SURF_V0.tickRate;
     this.lab = buildLab(this.scene, this.world);
+    this.checkpointSystem = new CheckpointSystem(
+      this.lab.checkpoints,
+      this.lab.finish,
+      {
+        x: PLAYER_DIMENSIONS.radius,
+        y: PLAYER_DIMENSIONS.standingHeight / 2,
+        z: PLAYER_DIMENSIONS.radius,
+      },
+    );
 
     const halfHeight =
       (PLAYER_DIMENSIONS.standingHeight - PLAYER_DIMENSIONS.radius * 2) / 2;
@@ -315,6 +448,15 @@ export class GameRuntime {
       }
     }
 
+    if (
+      this.fpsLimit > 0
+      && this.lastRenderSeconds > 0
+      && timestampSeconds - this.lastRenderSeconds < 1 / this.fpsLimit
+    ) {
+      return;
+    }
+    this.lastRenderSeconds = timestampSeconds;
+
     this.syncCamera();
     this.viewmodel?.update(
       timestampSeconds,
@@ -341,61 +483,67 @@ export class GameRuntime {
       return;
     }
 
-    const input = this.readMovementInput();
-    const result = simulateMovement(
+    const previousPosition = { ...this.movementState.position };
+    const input = this.playbackFrames
+      ? this.playbackFrames[this.movementState.tick]
+      : this.readMovementInput();
+    if (!input) {
+      this.playbackFrames = null;
+      this.setStatus("paused");
+      return;
+    }
+
+    if (this.playbackFrames) {
+      this.yaw = input.yaw;
+      this.pitch = input.pitch;
+    } else {
+      this.replayFrames.push(input);
+    }
+
+    const result = simulateRunTick(
       this.movementState,
       input,
       COMMUNITY_AUTOBHOP_SURF_V0,
+      {
+        resolveMovement: (_state, displacement) => {
+          this.characterController!.computeColliderMovement(
+            this.playerCollider!,
+            displacement,
+          );
+          const movement = this.characterController!.computedMovement();
+          const currentPosition = this.playerCollider!.translation();
+          const collisions = [];
+          for (
+            let index = 0;
+            index < this.characterController!.numComputedCollisions();
+            index += 1
+          ) {
+            const collision = this.characterController!.computedCollision(index);
+            if (collision) collisions.push({ normal: { ...collision.normal1 } });
+          }
+          return {
+            position: {
+              x: currentPosition.x + movement.x,
+              y: currentPosition.y + movement.y,
+              z: currentPosition.z + movement.z,
+            },
+            grounded: this.characterController!.computedGrounded(),
+            collisions,
+          };
+        },
+      },
+      { maxSurfNormalY: MAX_SURF_NORMAL_Y },
     );
 
-    this.characterController.computeColliderMovement(
-      this.playerCollider,
-      result.displacement,
-    );
-    const movement = this.characterController.computedMovement();
-    const currentPosition = this.playerCollider.translation();
-    const nextPosition = {
-      x: currentPosition.x + movement.x,
-      y: currentPosition.y + movement.y,
-      z: currentPosition.z + movement.z,
-    };
-    this.playerCollider.setTranslation(nextPosition);
-
-    let velocity = { ...result.velocity };
-    let surfing = false;
-    for (
-      let index = 0;
-      index < this.characterController.numComputedCollisions();
-      index += 1
-    ) {
-      const collision = this.characterController.computedCollision(index);
-      if (!collision) continue;
-
-      const normal = collision.normal1;
-      if (normal.y > 0.01 && normal.y < MAX_SURF_NORMAL_Y) {
-        surfing = true;
-      }
-      velocity = clipVelocityToPlane(velocity, normal);
-    }
-
-    const grounded = this.characterController.computedGrounded() && !surfing;
-    if (grounded && velocity.y < 0) {
-      velocity.y = 0;
-    }
-
-    this.movementState = {
-      position: nextPosition,
-      velocity,
-      grounded,
-      tick: this.movementState.tick + 1,
-    };
-    this.surfing = surfing;
+    this.playerCollider.setTranslation(result.state.position);
+    this.movementState = result.state;
+    this.surfing = result.surfing;
     this.elapsedTicks += 1;
-    this.updateProgress();
+    this.updateProgress(previousPosition, result.state.position, result.stateHash);
     this.world.step();
   }
 
-  private readMovementInput(): MovementInput {
+  private readMovementInput(): RunInputFrame {
     const forward =
       Number(this.pressedKeys.has("KeyW")) -
       Number(this.pressedKeys.has("KeyS"));
@@ -403,37 +551,50 @@ export class GameRuntime {
       Number(this.pressedKeys.has("KeyD")) -
       Number(this.pressedKeys.has("KeyA"));
 
+    const jump = this.autoBhop
+      ? this.pressedKeys.has("Space")
+      : this.jumpQueued;
+    this.jumpQueued = false;
+    let buttons = 0;
+    if (this.pressedKeys.has("KeyW")) buttons |= RunButton.Forward;
+    if (this.pressedKeys.has("KeyS")) buttons |= RunButton.Back;
+    if (this.pressedKeys.has("KeyA")) buttons |= RunButton.Left;
+    if (this.pressedKeys.has("KeyD")) buttons |= RunButton.Right;
+    if (jump) buttons |= RunButton.Jump;
+    if (this.primaryAttackHeld) buttons |= RunButton.PrimaryAttack;
+    if (this.secondaryAttackHeld) buttons |= RunButton.SecondaryAttack;
+    if (this.inspectHeld) buttons |= RunButton.Inspect;
+
     return {
+      tick: (this.movementState?.tick ?? 0) + 1,
       forward,
       side,
-      jump: this.pressedKeys.has("Space"),
+      jump,
       yaw: this.yaw,
+      pitch: this.pitch,
+      buttons,
     };
   }
 
-  private updateProgress(): void {
-    if (!this.movementState || !this.lab) return;
+  private updateProgress(from: Vec3, to: Vec3, stateHash: string): void {
+    if (!this.movementState || !this.lab || !this.checkpointSystem) return;
 
-    const passedCheckpoints = this.lab.checkpoints.filter(
-      (checkpoint) => this.movementState!.position.z <= checkpoint.z,
-    ).length;
-    this.currentCheckpoint = Math.max(
-      this.currentCheckpoint,
-      passedCheckpoints,
-    );
+    const progress = this.checkpointSystem.update(from, to);
+    this.currentCheckpoint = progress.checkpoint;
 
     if (this.movementState.position.y < -12 || this.movementState.position.z > 22) {
       this.respawnAtCheckpoint();
       return;
     }
 
-    if (this.movementState.position.z <= this.lab.finishZ) {
+    if (progress.finished) {
       const elapsedSeconds =
         this.elapsedTicks / COMMUNITY_AUTOBHOP_SURF_V0.tickRate;
       if (this.bestSeconds === null || elapsedSeconds < this.bestSeconds) {
         this.bestSeconds = elapsedSeconds;
         window.localStorage.setItem(BEST_TIME_KEY, String(elapsedSeconds));
       }
+      this.finishReplay(stateHash);
       this.setStatus("finished");
       document.exitPointerLock();
       this.emitTelemetry();
@@ -475,6 +636,7 @@ export class GameRuntime {
 
   private setStatus(status: RuntimeStatus): void {
     this.status = status;
+    if (status !== "running") this.clearAttackInput();
     this.callbacks.onStatus(status);
     this.emitTelemetry();
   }
@@ -508,6 +670,7 @@ export class GameRuntime {
     if (!checkpoint) return;
 
     this.currentCheckpoint = checkpointIndex + 1;
+    this.checkpointSystem?.reset(this.currentCheckpoint);
     this.movementState = createInitialMovementState(checkpoint.spawn);
     this.playerCollider.setTranslation(this.movementState.position);
     this.accumulatorSeconds = 0;
@@ -525,6 +688,46 @@ export class GameRuntime {
     return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
   }
 
+  private readLastReplay(): RunReplay | null {
+    try {
+      const stored = window.localStorage.getItem(LAST_REPLAY_KEY);
+      if (!stored) return null;
+      const replay = JSON.parse(stored) as unknown;
+      return isRunReplay(replay)
+        && replay.profileId === COMMUNITY_AUTOBHOP_SURF_V0.id
+        && replay.tickRate === COMMUNITY_AUTOBHOP_SURF_V0.tickRate
+        ? replay
+        : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private finishReplay(stateHash: string): void {
+    if (this.playbackFrames) {
+      if (this.lastReplay && this.lastReplay.finalStateHash !== stateHash) {
+        console.warn(
+          "Replay verification failed",
+          { expected: this.lastReplay.finalStateHash, actual: stateHash },
+        );
+      }
+      this.playbackFrames = null;
+      return;
+    }
+
+    const replay = createRunReplay(
+      COMMUNITY_AUTOBHOP_SURF_V0,
+      this.replayFrames,
+      stateHash,
+    );
+    this.lastReplay = replay;
+    try {
+      window.localStorage.setItem(LAST_REPLAY_KEY, JSON.stringify(replay));
+    } catch {
+      // A long run can exceed storage quota. In-memory replay remains usable.
+    }
+  }
+
   private onKeyDown = (event: KeyboardEvent): void => {
     if (["Space", "KeyW", "KeyA", "KeyS", "KeyD"].includes(event.code)) {
       event.preventDefault();
@@ -535,8 +738,14 @@ export class GameRuntime {
       return;
     }
 
+    if (event.code === "Space" && !event.repeat) {
+      this.jumpQueued = true;
+    }
+
     if (event.code === "KeyF" && !event.repeat && this.status === "running") {
-      this.viewmodel?.inspect();
+      event.preventDefault();
+      this.inspectHeld = true;
+      this.viewmodel?.setInspectHeld(true);
       return;
     }
 
@@ -560,6 +769,10 @@ export class GameRuntime {
   };
 
   private onKeyUp = (event: KeyboardEvent): void => {
+    if (event.code === "KeyF") {
+      this.inspectHeld = false;
+      this.viewmodel?.setInspectHeld(false);
+    }
     this.pressedKeys.delete(event.code);
   };
 
@@ -575,6 +788,33 @@ export class GameRuntime {
     );
   };
 
+  private onMouseDown = (event: MouseEvent): void => {
+    if (this.status !== "running") return;
+    if (event.button !== 0 && event.button !== 2) return;
+
+    event.preventDefault();
+    if (event.button === 0) {
+      this.primaryAttackHeld = true;
+      this.viewmodel?.attackPrimary();
+    } else {
+      this.secondaryAttackHeld = true;
+      this.viewmodel?.attackSecondary();
+    }
+    this.syncAttackHeldState();
+  };
+
+  private onMouseUp = (event: MouseEvent): void => {
+    if (event.button === 0) this.primaryAttackHeld = false;
+    else if (event.button === 2) this.secondaryAttackHeld = false;
+    else return;
+
+    this.syncAttackHeldState();
+  };
+
+  private onContextMenu = (event: MouseEvent): void => {
+    if (this.status === "running") event.preventDefault();
+  };
+
   private onPointerLockChange = (): void => {
     const isLocked = document.pointerLockElement === this.canvas;
     if (isLocked) {
@@ -582,6 +822,7 @@ export class GameRuntime {
       this.setStatus("running");
     } else if (this.status === "running") {
       this.pressedKeys.clear();
+      this.clearAttackInput();
       this.setStatus("paused");
     }
   };
@@ -589,6 +830,7 @@ export class GameRuntime {
   private onVisibilityChange = (): void => {
     if (document.hidden) {
       if (this.status === "running") {
+        this.clearAttackInput();
         document.exitPointerLock();
       }
       this.renderer.setAnimationLoop(null);
@@ -614,6 +856,9 @@ export class GameRuntime {
     window.addEventListener("keydown", this.onKeyDown);
     window.addEventListener("keyup", this.onKeyUp);
     window.addEventListener("mousemove", this.onMouseMove);
+    window.addEventListener("mouseup", this.onMouseUp);
+    this.canvas.addEventListener("mousedown", this.onMouseDown);
+    this.canvas.addEventListener("contextmenu", this.onContextMenu);
     window.addEventListener("resize", this.resize);
     document.addEventListener("pointerlockchange", this.onPointerLockChange);
     document.addEventListener("visibilitychange", this.onVisibilityChange);
@@ -623,8 +868,26 @@ export class GameRuntime {
     window.removeEventListener("keydown", this.onKeyDown);
     window.removeEventListener("keyup", this.onKeyUp);
     window.removeEventListener("mousemove", this.onMouseMove);
+    window.removeEventListener("mouseup", this.onMouseUp);
+    this.canvas.removeEventListener("mousedown", this.onMouseDown);
+    this.canvas.removeEventListener("contextmenu", this.onContextMenu);
     window.removeEventListener("resize", this.resize);
     document.removeEventListener("pointerlockchange", this.onPointerLockChange);
     document.removeEventListener("visibilitychange", this.onVisibilityChange);
+  }
+
+  private syncAttackHeldState(): void {
+    this.viewmodel?.setAttackHeld(
+      this.primaryAttackHeld,
+      this.secondaryAttackHeld,
+    );
+  }
+
+  private clearAttackInput(): void {
+    this.primaryAttackHeld = false;
+    this.secondaryAttackHeld = false;
+    this.inspectHeld = false;
+    this.syncAttackHeldState();
+    this.viewmodel?.setInspectHeld(false);
   }
 }
